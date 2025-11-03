@@ -29,7 +29,7 @@ jobs:
           # (Optional) Restart the Remote Desktop service to ensure changes take effect
           Restart-Service -Name TermService -Force
 
-      - name: Create RDP User with Secure Password
+      - name: Create VID User with Secure Password
         run: |
           Add-Type -AssemblyName System.Security
           $charSet = @{
@@ -86,7 +86,7 @@ jobs:
           }
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
       
-      - name: Verify RDP Accessibility
+      - name: Verify VID Accessibility
         run: |
           Write-Host "Tailscale IP: $env:TAILSCALE_IP"
           
