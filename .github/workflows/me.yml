@@ -8,8 +8,7 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 3600
     env:
-      # Optional: set in repo/org secrets to keep a stable password across reruns
-      RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+      RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}        # optional: stable password across re-runs
       TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
 
     steps:
@@ -18,12 +17,14 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
 
-          # Enable RDP & (optionally) relax security for compatibility
+          # Enable RDP
           $tsKey = 'HKLM:\System\CurrentControlSet\Control\Terminal Server'
-          if ((Get-ItemProperty -Path $tsKey -Name fDenyTSConnections -ErrorAction SilentlyContinue).fDenyTSConnections -ne 0) {
+          $cur = Get-ItemProperty -Path $tsKey -Name fDenyTSConnections -ErrorAction SilentlyContinue
+          if ($null -eq $cur -or $cur.fDenyTSConnections -ne 0) {
             Set-ItemProperty -Path $tsKey -Name fDenyTSConnections -Value 0 -Force
           }
 
+          # (Optional) relax NLA/security for compatibility
           $rdpKey = 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp'
           foreach ($name in 'UserAuthentication','SecurityLayer') {
             if (-not (Get-ItemProperty -Path $rdpKey -Name $name -ErrorAction SilentlyContinue)) {
@@ -35,14 +36,15 @@ jobs:
 
           # Ensure single firewall rule for 3389
           $ruleName = 'RDP-Tailscale'
-          $rule = (Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue)
+          $rule = Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue
           if ($null -eq $rule) {
             New-NetFirewallRule -DisplayName $ruleName -Direction Inbound -Action Allow -Protocol TCP -LocalPort 3389 | Out-Null
           } else {
             Set-NetFirewallRule -DisplayName $ruleName -Enabled True -Action Allow | Out-Null
           }
 
-          # Restart TermService if settings changed (safe to call even if already running)
+          # Make sure service is auto and restarted
+          Set-Service -Name TermService -StartupType Automatic
           Restart-Service -Name TermService -Force -ErrorAction SilentlyContinue
 
       - name: Create/Ensure RDP User (idempotent)
@@ -77,13 +79,12 @@ jobs:
             Write-Host "Created local user '$userName'."
             $createdNew = $true
           } else {
-            Write-Host "User '$userName' already exists. Will not reset password."
+            Write-Host "User '$userName' already exists. Will not reset password unless secret provided."
             if ($passwordToUse) {
-              # If you provided a secret password, ensure the account uses it (idempotent reset)
               try {
                 $secure = ConvertTo-SecureString $passwordToUse -AsPlainText -Force
                 Set-LocalUser -Name $userName -Password $secure
-                Write-Host "Synchronized existing user password from secret."
+                Write-Host "Synchronized user password from secret."
               } catch {
                 Write-Warning "Could not reset password; proceeding with existing password."
               }
@@ -91,20 +92,17 @@ jobs:
             $createdNew = $false
           }
 
-          # Ensure group memberships (safe if already a member)
+          # Ensure group memberships (idempotent)
           foreach ($grp in 'Administrators','Remote Desktop Users') {
-            if (-not (Get-LocalGroupMember -Group $grp -ErrorAction SilentlyContinue | Where-Object { $_.Name -match "^\w*\\$userName$" })) {
+            $members = Get-LocalGroupMember -Group $grp -ErrorAction SilentlyContinue
+            if ($null -eq ($members | Where-Object { $_.Name -like "*\$userName" })) {
               Add-LocalGroupMember -Group $grp -Member $userName -ErrorAction SilentlyContinue
             }
           }
 
-          if ($createdNew -and $passwordToUse) {
-            "RDP_CREDS=User: $userName | Password: $passwordToUse" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          } elseif ($passwordToUse) {
-            # You provided a secret; we can safely surface it again.
+          if ($passwordToUse) {
             "RDP_CREDS=User: $userName | Password: $passwordToUse" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           } else {
-            # No way to retrieve an old random password
             "RDP_CREDS=User: $userName | Password: (unchanged; not displayed)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           }
 
@@ -114,13 +112,12 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $desiredVersion = '1.82.0'
           $tsExe = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
-          $installed = Test-Path $tsExe
           $needInstall = $true
 
-          if ($installed) {
+          if (Test-Path $tsExe) {
             try {
-              $ver = (& $tsExe version 2>$null) | Select-Object -First 1
-              if ($ver -match $desiredVersion) { $needInstall = $false }
+              $verLine = & $tsExe version 2>$null
+              if ($verLine -match [regex]::Escape($desiredVersion)) { $needInstall = $false }
             } catch { $needInstall = $true }
           }
 
@@ -142,19 +139,18 @@ jobs:
           $ts = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
 
           if (-not $env:TAILSCALE_AUTH_KEY) {
-            Write-Error "TAILSCALE_AUTH_KEY secret is required."
+            throw "TAILSCALE_AUTH_KEY secret is required."
           }
 
           # Try to fetch existing IP first
           $tsIP = & $ts ip -4 2>$null
           if (-not $tsIP) {
-            # Bring up (idempotent; will reuse state if already logged in)
+            # Bring up (idempotent; reuses state if already logged in)
             & $ts up --authkey="$env:TAILSCALE_AUTH_KEY" --hostname="gh-runner-$env:GITHUB_RUN_ID"
             Start-Sleep -Seconds 3
             $tsIP = & $ts ip -4
           }
 
-          # Wait a bit if still not assigned
           $retries = 0
           while (-not $tsIP -and $retries -lt 10) {
             Start-Sleep -Seconds 5
@@ -162,9 +158,7 @@ jobs:
             $retries++
           }
 
-          if (-not $tsIP) {
-            Write-Error "Tailscale IP not assigned."
-          }
+          if (-not $tsIP) { throw "Tailscale IP not assigned." }
 
           "TAILSCALE_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           Write-Host "Tailscale IP: $tsIP"
@@ -174,19 +168,12 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           Write-Host "Testing TCP 3389 on $env:TAILSCALE_IP ..."
-          $ok = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
-          if (-not $ok.TcpTestSucceeded) { throw "TCP connection to 3389 failed" }
-          Write-Host "TCP connectivity successful."
-
-      - name: Maintain Connection (until cancelled)
-        shell: pwsh
-        run: |
-          Write-Host "`n=== RDP ACCESS ==="
-          Write-Host "Address: $env:TAILSCALE_IP"
-          Write-Host "Username: RDP"
-          Write-Host "Password: $env:RDP_CREDS"
-          Write-Host "==================`n"
-          while ($true) {
-            Write-Host "[$(Get-Date)] RDP Active - cancel the workflow to terminate"
-            Start-Sleep -Seconds 300
+          $ok = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -InformationLevel Quiet
+          if (-not $ok) {
+            Write-Warning "Self-connection via Tailscale failed; checking local listener on 3389..."
+            $listening = Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue
+            if (-not $listening) { throw "RDP is not listening on port 3389" }
           }
+          Write-Host "RDP appears reachable/listening."
+
+      - name: Maintain Connection (u
