@@ -1,0 +1,192 @@
+name: New Test RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 3600
+    env:
+      # Optional: set in repo/org secrets to keep a stable password across reruns
+      RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+      TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+
+    steps:
+      - name: Configure Core RDP Settings (idempotent)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          # Enable RDP & (optionally) relax security for compatibility
+          $tsKey = 'HKLM:\System\CurrentControlSet\Control\Terminal Server'
+          if ((Get-ItemProperty -Path $tsKey -Name fDenyTSConnections -ErrorAction SilentlyContinue).fDenyTSConnections -ne 0) {
+            Set-ItemProperty -Path $tsKey -Name fDenyTSConnections -Value 0 -Force
+          }
+
+          $rdpKey = 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp'
+          foreach ($name in 'UserAuthentication','SecurityLayer') {
+            if (-not (Get-ItemProperty -Path $rdpKey -Name $name -ErrorAction SilentlyContinue)) {
+              New-ItemProperty -Path $rdpKey -Name $name -PropertyType DWord -Value 0 -Force | Out-Null
+            } else {
+              Set-ItemProperty -Path $rdpKey -Name $name -Value 0 -Force
+            }
+          }
+
+          # Ensure single firewall rule for 3389
+          $ruleName = 'RDP-Tailscale'
+          $rule = (Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue)
+          if ($null -eq $rule) {
+            New-NetFirewallRule -DisplayName $ruleName -Direction Inbound -Action Allow -Protocol TCP -LocalPort 3389 | Out-Null
+          } else {
+            Set-NetFirewallRule -DisplayName $ruleName -Enabled True -Action Allow | Out-Null
+          }
+
+          # Restart TermService if settings changed (safe to call even if already running)
+          Restart-Service -Name TermService -Force -ErrorAction SilentlyContinue
+
+      - name: Create/Ensure RDP User (idempotent)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $userName = 'RDP'
+          $existing = Get-LocalUser -Name $userName -ErrorAction SilentlyContinue
+
+          function New-RandomPassword {
+            Add-Type -AssemblyName System.Security
+            $charSet = @{
+              Upper   = [char[]](65..90)
+              Lower   = [char[]](97..122)
+              Number  = [char[]](48..57)
+              Special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126))
+            }
+            $raw = @()
+            $raw += $charSet.Upper   | Get-Random -Count 4
+            $raw += $charSet.Lower   | Get-Random -Count 4
+            $raw += $charSet.Number  | Get-Random -Count 4
+            $raw += $charSet.Special | Get-Random -Count 4
+            -join ($raw | Sort-Object { Get-Random })
+          }
+
+          $passwordToUse = $env:RDP_PASSWORD
+
+          if ($null -eq $existing) {
+            if (-not $passwordToUse) { $passwordToUse = New-RandomPassword }
+            $secure = ConvertTo-SecureString $passwordToUse -AsPlainText -Force
+            New-LocalUser -Name $userName -Password $secure -AccountNeverExpires | Out-Null
+            Write-Host "Created local user '$userName'."
+            $createdNew = $true
+          } else {
+            Write-Host "User '$userName' already exists. Will not reset password."
+            if ($passwordToUse) {
+              # If you provided a secret password, ensure the account uses it (idempotent reset)
+              try {
+                $secure = ConvertTo-SecureString $passwordToUse -AsPlainText -Force
+                Set-LocalUser -Name $userName -Password $secure
+                Write-Host "Synchronized existing user password from secret."
+              } catch {
+                Write-Warning "Could not reset password; proceeding with existing password."
+              }
+            }
+            $createdNew = $false
+          }
+
+          # Ensure group memberships (safe if already a member)
+          foreach ($grp in 'Administrators','Remote Desktop Users') {
+            if (-not (Get-LocalGroupMember -Group $grp -ErrorAction SilentlyContinue | Where-Object { $_.Name -match "^\w*\\$userName$" })) {
+              Add-LocalGroupMember -Group $grp -Member $userName -ErrorAction SilentlyContinue
+            }
+          }
+
+          if ($createdNew -and $passwordToUse) {
+            "RDP_CREDS=User: $userName | Password: $passwordToUse" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          } elseif ($passwordToUse) {
+            # You provided a secret; we can safely surface it again.
+            "RDP_CREDS=User: $userName | Password: $passwordToUse" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          } else {
+            # No way to retrieve an old random password
+            "RDP_CREDS=User: $userName | Password: (unchanged; not displayed)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          }
+
+      - name: Install/Ensure Tailscale (idempotent)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $desiredVersion = '1.82.0'
+          $tsExe = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
+          $installed = Test-Path $tsExe
+          $needInstall = $true
+
+          if ($installed) {
+            try {
+              $ver = (& $tsExe version 2>$null) | Select-Object -First 1
+              if ($ver -match $desiredVersion) { $needInstall = $false }
+            } catch { $needInstall = $true }
+          }
+
+          if ($needInstall) {
+            $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-$desiredVersion-amd64.msi"
+            $installerPath = "$env:TEMP\tailscale.msi"
+            Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+            Start-Process msiexec.exe -ArgumentList "/i","`"$installerPath`"","/quiet","/norestart" -Wait
+            Remove-Item $installerPath -Force
+            Write-Host "Installed/updated Tailscale $desiredVersion."
+          } else {
+            Write-Host "Tailscale $desiredVersion already installed."
+          }
+
+      - name: Establish/Reuse Tailscale Connection
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ts = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
+
+          if (-not $env:TAILSCALE_AUTH_KEY) {
+            Write-Error "TAILSCALE_AUTH_KEY secret is required."
+          }
+
+          # Try to fetch existing IP first
+          $tsIP = & $ts ip -4 2>$null
+          if (-not $tsIP) {
+            # Bring up (idempotent; will reuse state if already logged in)
+            & $ts up --authkey="$env:TAILSCALE_AUTH_KEY" --hostname="gh-runner-$env:GITHUB_RUN_ID"
+            Start-Sleep -Seconds 3
+            $tsIP = & $ts ip -4
+          }
+
+          # Wait a bit if still not assigned
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+            Start-Sleep -Seconds 5
+            $tsIP = & $ts ip -4
+            $retries++
+          }
+
+          if (-not $tsIP) {
+            Write-Error "Tailscale IP not assigned."
+          }
+
+          "TAILSCALE_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "Tailscale IP: $tsIP"
+
+      - name: Verify RDP Accessibility
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Write-Host "Testing TCP 3389 on $env:TAILSCALE_IP ..."
+          $ok = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $ok.TcpTestSucceeded) { throw "TCP connection to 3389 failed" }
+          Write-Host "TCP connectivity successful."
+
+      - name: Maintain Connection (until cancelled)
+        shell: pwsh
+        run: |
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          Write-Host "Password: $env:RDP_CREDS"
+          Write-Host "==================`n"
+          while ($true) {
+            Write-Host "[$(Get-Date)] RDP Active - cancel the workflow to terminate"
+            Start-Sleep -Seconds 300
+          }
