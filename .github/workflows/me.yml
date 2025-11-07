@@ -176,4 +176,14 @@ jobs:
           }
           Write-Host "RDP appears reachable/listening."
 
-      - name: Maintain Connection (u
+      - name: Maintain Connection (until cancelled)
+        shell: pwsh
+        run: |
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host $env:RDP_CREDS
+          Write-Host "==================`n"
+          while ($true) {
+            Write-Host "[$(Get-Date)] RDP Active - cancel the workflow to terminate"
+            Start-Sleep -Seconds 300
+          }
