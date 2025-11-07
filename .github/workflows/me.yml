@@ -8,7 +8,9 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 3600
     env:
-      RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}        # optional: stable password across re-runs
+      # Optional: stable password across re-runs (recommended)
+      RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+      # Required: real Tailscale AUTH key (tskey-auth-... or tskey-ephemeral-...)
       TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
 
     steps:
@@ -24,7 +26,7 @@ jobs:
             Set-ItemProperty -Path $tsKey -Name fDenyTSConnections -Value 0 -Force
           }
 
-          # (Optional) relax NLA/security for compatibility
+          # (Optional) relax NLA/security for compatibility (set to 1/1 if you want NLA)
           $rdpKey = 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp'
           foreach ($name in 'UserAuthentication','SecurityLayer') {
             if (-not (Get-ItemProperty -Path $rdpKey -Name $name -ErrorAction SilentlyContinue)) {
@@ -48,6 +50,7 @@ jobs:
           Restart-Service -Name TermService -Force -ErrorAction SilentlyContinue
 
       - name: Create/Ensure RDP User (idempotent)
+        id: create_user
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -71,6 +74,7 @@ jobs:
           }
 
           $passwordToUse = $env:RDP_PASSWORD
+          $createdNew = $false
 
           if ($null -eq $existing) {
             if (-not $passwordToUse) { $passwordToUse = New-RandomPassword }
@@ -79,17 +83,17 @@ jobs:
             Write-Host "Created local user '$userName'."
             $createdNew = $true
           } else {
-            Write-Host "User '$userName' already exists. Will not reset password unless secret provided."
-            if ($passwordToUse) {
-              try {
-                $secure = ConvertTo-SecureString $passwordToUse -AsPlainText -Force
-                Set-LocalUser -Name $userName -Password $secure
-                Write-Host "Synchronized user password from secret."
-              } catch {
-                Write-Warning "Could not reset password; proceeding with existing password."
-              }
-            }
-            $createdNew = $false
+            Write-Host "User '$userName' already exists. Skipping creation."
+            # If you *want* to force-reset on reruns when RDP_PASSWORD is provided, uncomment next lines:
+            # if ($passwordToUse) {
+            #   try {
+            #     $secure = ConvertTo-SecureString $passwordToUse -AsPlainText -Force
+            #     Set-LocalUser -Name $userName -Password $secure
+            #     Write-Host "Synchronized user password from secret."
+            #   } catch {
+            #     Write-Warning "Could not reset password; proceeding with existing password."
+            #   }
+            # }
           }
 
           # Ensure group memberships (idempotent)
@@ -100,11 +104,13 @@ jobs:
             }
           }
 
-          if ($passwordToUse) {
+          # Only expose password when newly created (or if you re-enable forced reset above)
+          if ($createdNew -and $passwordToUse) {
             "RDP_CREDS=User: $userName | Password: $passwordToUse" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          } else {
-            "RDP_CREDS=User: $userName | Password: (unchanged; not displayed)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           }
+
+          # Output a flag for later steps
+          "created=$createdNew" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
       - name: Install/Ensure Tailscale (idempotent)
         shell: pwsh
@@ -138,15 +144,15 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $ts = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
 
-          if (-not $env:TAILSCALE_AUTH_KEY) {
-            throw "TAILSCALE_AUTH_KEY secret is required."
+          if (-not $env:TAILSCALE_AUTH_KEY) { throw "TAILSCALE_AUTH_KEY secret is required." }
+          if ($env:TAILSCALE_AUTH_KEY -notmatch '^tskey-(auth|ephemeral)-') {
+            throw "TAILSCALE_AUTH_KEY must start with tskey-auth- or tskey-ephemeral-."
           }
 
-          # Try to fetch existing IP first
+          # Try to fetch existing IP first (idempotent)
           $tsIP = & $ts ip -4 2>$null
           if (-not $tsIP) {
-            # Bring up (idempotent; reuses state if already logged in)
-            & $ts up --authkey="$env:TAILSCALE_AUTH_KEY" --hostname="gh-runner-$env:GITHUB_RUN_ID"
+            & $ts up --authkey="$env:TAILSCALE_AUTH_KEY" --hostname="gh-runner-$env:GITHUB_RUN_ID" --force-reauth
             Start-Sleep -Seconds 3
             $tsIP = & $ts ip -4
           }
@@ -158,7 +164,10 @@ jobs:
             $retries++
           }
 
-          if (-not $tsIP) { throw "Tailscale IP not assigned." }
+          if (-not $tsIP) {
+            $status = & $ts status 2>$null
+            throw "Tailscale IP not assigned. Current status:`n$status"
+          }
 
           "TAILSCALE_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           Write-Host "Tailscale IP: $tsIP"
@@ -181,7 +190,14 @@ jobs:
         run: |
           Write-Host "`n=== RDP ACCESS ==="
           Write-Host "Address: $env:TAILSCALE_IP"
-          Write-Host $env:RDP_CREDS
+          Write-Host "Username: RDP"
+          # Only show password when the user was just created
+          if ("${{ steps.create_user.outputs.created }}" -eq "True") {
+            Write-Host "Password: (see RDP_CREDS in env)"
+            Write-Host $env:RDP_CREDS
+          } else {
+            Write-Host "Password: (unchanged; not displayed)"
+          }
           Write-Host "==================`n"
           while ($true) {
             Write-Host "[$(Get-Date)] RDP Active - cancel the workflow to terminate"
