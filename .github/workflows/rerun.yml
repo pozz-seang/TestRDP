@@ -4,7 +4,7 @@ on:
 
 jobs:
   secure-rdp:
-    runs-on: [self-hosted, windows]   # <— your machine
+    runs-on: [self-hosted, gh-runner-19161407718-1]   # <— your machine
     timeout-minutes: 3600
 
     steps:
