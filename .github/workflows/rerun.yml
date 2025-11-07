@@ -1,0 +1,24 @@
+name: Rerun RDP
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: [self-hosted, windows]   # <— your machine
+    timeout-minutes: 3600
+
+    steps:
+      - name: Show Tailscale status
+        shell: powershell
+        run: |
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" status
+          $ip = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+          Write-Host "Tailscale IPv4: $ip"
+
+      - name: (Optional) Keep job alive
+        shell: powershell
+        run: |
+          while ($true) {
+            Write-Host "[$(Get-Date)] RDP available via Tailscale"
+            Start-Sleep -Seconds 300
+          }
